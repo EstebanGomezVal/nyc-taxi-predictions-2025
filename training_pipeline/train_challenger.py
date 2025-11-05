@@ -1,3 +1,4 @@
+import os
 import math
 import optuna
 import pathlib
@@ -7,10 +8,16 @@ import pandas as pd
 import xgboost as xgb
 from dotenv import load_dotenv
 from mlflow.tracking import MlflowClient
+from optuna.samplers import TPESampler
+from mlflow.models.signature import infer_signature
 from sklearn.metrics import root_mean_squared_error
 from sklearn.feature_extraction import DictVectorizer
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from prefect import flow, task
-import os
+import time
+
+EXPERIMENT_NAME = "/Users/estebangmzv@gmail.com/nyc-taxi-experiment-prefect"
+MODEL_NAME_UC = "workspace.default.nyc-taxi-model-prefect" 
 
 @task(name="Read Data")
 def read_data(file_path: str) -> pd.DataFrame:
@@ -51,126 +58,170 @@ def add_features(df_train: pd.DataFrame, df_val: pd.DataFrame):
     y_val = df_val["duration"].values
     return X_train, X_val, y_train, y_val, dv
 
-
-@task(name="Train Challenger Model")
-def train_challenger_model(X_train, X_val, y_train, y_val, dv, experiment_id: str) -> str:
-    """Entrena un modelo con un set de hiperparámetros fijo (Challenger) y lo registra."""
+@task(name="Tune Model Family")
+def tune_model_family(X_train, X_val, y_train, y_val, model_family: str):
+    """Realiza la optimización de hiperparámetros para una familia de modelos (RF o GB)."""
     
-    params = {
-        "max_depth": 10,
-        "learning_rate": 0.1,
-        "reg_alpha": 0.001,
-        "reg_lambda": 0.0001,
-        "min_child_weight": 1.0,
-        "objective": "reg:squarederror",
-        "seed": 42,
-    }
+    sampler = TPESampler(seed=42)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
 
-    with mlflow.start_run(experiment_id=experiment_id, run_name="Challenger Model Training"):
-        train = xgb.DMatrix(X_train, label=y_train)
-        valid = xgb.DMatrix(X_val, label=y_val)
+    def objective(trial: optuna.trial.Trial):
+        with mlflow.start_run(nested=True):
+            mlflow.set_tag("model_family", model_family)
+            
+            if model_family == "random_forest":
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                    "max_depth": trial.suggest_int("max_depth", 3, 30),
+                    "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                    "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 4),
+                    "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+                    "random_state": 42,
+                    "n_jobs": -1
+                }
+                model = RandomForestRegressor(**params)
+            
+            elif model_family == "gradient_boosting":
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "max_depth": trial.suggest_int("max_depth", 2, 10),
+                    "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                    "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 4),
+                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                    "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+                    "random_state": 42
+                }
+                model = GradientBoostingRegressor(**params)
+            
+            else:
+                raise ValueError(f"Modelo no soportado: {model_family}")
+
+            mlflow.log_params(params)
+            model.fit(X_train, y_train)
+
+            y_pred = model.predict(X_val)
+            rmse = root_mean_squared_error(y_val, y_pred)
+            mlflow.log_metric("rmse", rmse)
+
+        return rmse
+
+    with mlflow.start_run(run_name=f"{model_family.replace('_', ' ').title()} Hyperparameter Optimization (Optuna)"):
+        study.optimize(objective, n_trials=3) 
         
-        booster = xgb.train(
-            params=params,
-            dtrain=train,
-            num_boost_round=100,
-            evals=[(valid, "validation")],
-            early_stopping_rounds=10,
-            verbose_eval=False
-        )
+        best_params = study.best_params
+        best_params["random_state"] = 42
+        
+        if model_family == "random_forest":
+             best_params["n_jobs"] = -1
+        
+        return best_params
 
-        y_pred = booster.predict(valid)
+@task(name="Train Final Challenger Model")
+def train_final_challenger(X_train, X_val, y_train, y_val, dv, best_params: dict, model_family: str) -> str:
+    """Entrena el modelo final con los mejores hiperparámetros y registra el run."""
+    
+    with mlflow.start_run(run_name=f"Challenger Model: {model_family.title()}") as run:
+        
+        mlflow.log_params(best_params)
+        mlflow.set_tags({"model_family": model_family, "challenger_status": "Candidate"})
+        
+        if model_family == "random_forest":
+            model = RandomForestRegressor(**best_params)
+        elif model_family == "gradient_boosting":
+            model = GradientBoostingRegressor(**best_params)
+        else:
+            raise ValueError(f"Modelo no soportado: {model_family}")
+        
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_val)
         rmse = root_mean_squared_error(y_val, y_pred)
         mlflow.log_metric("rmse", rmse)
-        mlflow.log_params(params)
-        
-        mlflow.xgboost.log_model(booster, "model", input_example=X_val[:5], signature=None)
-        
-        return mlflow.active_run().info.run_id
 
-@task(name="Evaluate and Promote Model")
-def evaluate_and_promote(X_val, y_val, challenger_run_id: str):
-    """Compara el Challenger con el Champion y promueve al mejor como el nuevo @champion."""
+        # Guardar preprocesador (artefacto)
+        pathlib.Path("preprocessor").mkdir(exist_ok=True)
+        with open("preprocessor/preprocessor.b", "wb") as f_out:
+            pickle.dump(dv, f_out)
+        mlflow.log_artifact("preprocessor/preprocessor.b", artifact_path="preprocessor")
 
-    MODEL_NAME = "workspace.default.nyc-taxi-model-prefect"
+        # Registrar modelo (artefacto)
+        feature_names = dv.get_feature_names_out()
+        input_example = pd.DataFrame(X_val[:5].toarray(), columns=feature_names)
+        signature = infer_signature(input_example, y_val[:5])
+
+        mlflow.sklearn.log_model(
+            model,
+            name="model",
+            input_example=input_example,
+            signature=signature,
+        )
+        return run.info.run_id
+
+@task(name="Compare and Promote Champion")
+def compare_and_promote(experiment_id: str):
+    """Busca el mejor modelo de todo el experimento, lo promueve como @champion, 
+       y asigna el alias @challenger al segundo mejor."""
+    
     client = MlflowClient()
     
-    challenger_run = client.get_run(challenger_run_id)
-    challenger_rmse = challenger_run.data.metrics["rmse"]
-    print(f"Challenger RMSE: {challenger_rmse:.4f} (Run ID: {challenger_run_id})")
-
-    try:
-        champion_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
-        champion_run_id = champion_version.run_id
-        
-        champion_run = client.get_run(champion_run_id)
-        champion_rmse = champion_run.data.metrics["rmse"]
-        print(f"Current Champion RMSE: {champion_rmse:.4f} (Version: {champion_version.version})")
-
-    except Exception as e:
-        print(f"No se encontró un Champion existente (o error de acceso): {e}. Promoviendo Challenger por defecto.")
-        champion_rmse = float('inf') 
-        champion_version = None
-
-
-    # --- 3. Comparación y Promoción ---
+    all_best_runs_df = mlflow.search_runs(
+        experiment_ids=[experiment_id],
+        filter_string="metrics.rmse >= 0", 
+        order_by=["metrics.rmse ASC"],
+    )
     
-    if challenger_rmse < champion_rmse:
-        print("Challenger supero al champion.")
+    champion_run = all_best_runs_df.iloc[0]
+    champion_run_id = champion_run["run_id"]
+    
+    model_uri = f"runs:/{champion_run_id}/model"
+    
+    try:
+        client.get_registered_model(name=MODEL_NAME_UC)
+    except Exception as e:
+        if "CATALOG_DOES_NOT_EXIST" in str(e) or "INVALID_PARAMETER_VALUE" in str(e):
+             return
+        client.create_registered_model(name=MODEL_NAME_UC)
         
-        model_uri = f"runs:/{challenger_run_id}/model"
-        
-        try:
-            client.get_registered_model(name=MODEL_NAME)
-        except Exception:
-            client.create_registered_model(name=MODEL_NAME)
+    new_model_version = client.create_model_version(
+        name=MODEL_NAME_UC, 
+        source=model_uri, 
+        run_id=champion_run_id
+    )
+    
+    client.set_registered_model_alias(
+        name=MODEL_NAME_UC, 
+        alias="champion", 
+        version=new_model_version.version
+    )
+    
 
-        new_model_version = client.create_model_version(
-            name=MODEL_NAME, 
-            source=model_uri, 
-            run_id=challenger_run_id
-        )
-        
-        client.set_registered_model_alias(
-            name=MODEL_NAME, 
-            alias="champion", 
-            version=new_model_version.version
-        )
-        
-        print(f"✅ Nuevo Champion: Versión {new_model_version.version} con RMSE {challenger_rmse:.4f}")
-
-        if champion_version:
-             client.set_registered_model_alias(
-                name=MODEL_NAME, 
-                alias="previous_champion", 
-                version=champion_version.version
-            )
-    else:
-        print("El Champion actual mantiene su título.")
-
-@flow(name="Challenger Champion Flow")
-def challenger_champion_flow(year: int, month_train: str, month_val: str) -> None:
-    """The main challenger-champion pipeline"""
+@flow(name="Challenger Comparison and Promotion Flow")
+def challenger_comparison_flow(year: int, month_train: str, month_val: str) -> None:
+    """The main flow to train two challenger models (RF/GB) and promote the best."""
     
     train_path = f"../data/green_tripdata_{year}-{month_train}.parquet"
     val_path = f"../data/green_tripdata_{year}-{month_val}.parquet"
     
     load_dotenv(override=True)
-    EXPERIMENT_NAME = "/Users/estebangmzv@gmail.com/nyc-taxi-experiment-prefect"
-    MODEL_NAME = "main.default.nyc-taxi-model-prefect" # Nombre completo de Unity Catalog
     
     mlflow.set_tracking_uri("databricks")
-    experiment = mlflow.set_experiment(experiment_name=EXPERIMENT_NAME)
+    mlflow.set_experiment(experiment_name=EXPERIMENT_NAME)
+    experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
     experiment_id = experiment.experiment_id
 
     df_train = read_data(train_path)
     df_val = read_data(val_path)
     X_train, X_val, y_train, y_val, dv = add_features(df_train, df_val)
-
-    challenger_run_id = train_challenger_model(X_train, X_val, y_train, y_val, dv, experiment_id)
     
-    evaluate_and_promote(X_val, y_val, challenger_run_id)
-
+    
+    best_params_rf = tune_model_family(X_train, X_val, y_train, y_val, "random_forest")
+    best_params_gb = tune_model_family(X_train, X_val, y_train, y_val, "gradient_boosting")
+    
+    train_final_challenger(X_train, X_val, y_train, y_val, dv, best_params_rf, "random_forest")
+    train_final_challenger(X_train, X_val, y_train, y_val, dv, best_params_gb, "gradient_boosting")
+    
+    compare_and_promote(experiment_id)
 
 if __name__ == "__main__":
-    challenger_champion_flow(year=2025, month_train="01", month_val="02")
+    challenger_comparison_flow(year=2025, month_train="01", month_val="02")
