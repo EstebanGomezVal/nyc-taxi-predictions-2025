@@ -17,7 +17,7 @@ from prefect import flow, task
 import time
 
 EXPERIMENT_NAME = "/Users/estebangmzv@gmail.com/nyc-taxi-experiment-prefect"
-MODEL_NAME_UC = "main.default.nyc-taxi-model-prefect" 
+MODEL_NAME_UC = "workspace.default.nyc-taxi-model-prefect" 
 
 @task(name="Read Data")
 def read_data(file_path: str) -> pd.DataFrame:
@@ -167,7 +167,7 @@ def compare_and_promote(experiment_id: str):
     
     all_best_runs_df = mlflow.search_runs(
         experiment_ids=[experiment_id],
-        filter_string="metrics.rmse IS NOT NULL", 
+        filter_string="metrics.rmse >= 0", 
         order_by=["metrics.rmse ASC"],
     )
     
