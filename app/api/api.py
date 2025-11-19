@@ -1,12 +1,13 @@
 import pickle
-import mlflow
 from fastapi import FastAPI
 from pydantic import BaseModel
 from mlflow import MlflowClient
 from dotenv import load_dotenv
 import os
+import mlflow
+import pandas as pd
 
-load_dotenv(override=True)  # Carga las variables del archivo .env
+load_dotenv(override=True) 
 
 mlflow.set_tracking_uri("databricks")
 client = MlflowClient()
@@ -31,7 +32,7 @@ client.download_artifacts(
 with open("preprocessor/preprocessor.b", "rb") as f_in:
     dv = pickle.load(f_in)
 
-model_name = "workspace.default.nyc-taxi-model"
+model_name = "workspace.default.nyc-taxi-model-prefect"
 alias = "champion"
 
 model_uri = f"models:/{model_name}@{alias}"
@@ -40,23 +41,30 @@ champion_model = mlflow.pyfunc.load_model(
     model_uri=model_uri
 )
 
-with open("preprocessor/preprocessor.b", "rb") as f_in:
-    dv = pickle.load(f_in)
-
 def preprocess(input_data):
 
     input_dict = {
         'PU_DO': input_data.PULocationID + "_" + input_data.DOLocationID,
         'trip_distance': input_data.trip_distance,
     }
+    X = dv.transform([input_dict])
 
-    return dv.transform(input_dict)
+    # Names depend on sklearn version
+    try:
+        cols = dv.get_feature_names_out()
+    except AttributeError:
+        cols = dv.get_feature_names()
+
+    # 
+    X_df = pd.DataFrame(X.toarray(), columns=cols)
+
+    return X_df
 
 def predict(input_data):
 
     X_val = preprocess(input_data)
 
-    return "4"#champion_model.predict(X_val)
+    return champion_model.predict(X_val)
 
 app = FastAPI()
 
