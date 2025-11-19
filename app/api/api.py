@@ -1,13 +1,13 @@
 import pickle
-import mlflow
 from fastapi import FastAPI
 from pydantic import BaseModel
 from mlflow import MlflowClient
 from dotenv import load_dotenv
 import os
+import mlflow
 import pandas as pd
 
-load_dotenv(override=True)  # Carga las variables del archivo .env
+load_dotenv(override=True) 
 
 mlflow.set_tracking_uri("databricks")
 client = MlflowClient()
@@ -16,7 +16,7 @@ EXPERIMENT_NAME = "/Users/estebangmzv@gmail.com/nyc-taxi-experiment-prefect"
 
 run_ = mlflow.search_runs(order_by=['metrics.rmse ASC'],
                           output_format="list",
-                          experiment_names=EXPERIMENT_NAME
+                          experiment_names=[EXPERIMENT_NAME]
                           )[0]
 
 run_id = run_.info.run_id
@@ -32,7 +32,7 @@ client.download_artifacts(
 with open("preprocessor/preprocessor.b", "rb") as f_in:
     dv = pickle.load(f_in)
 
-model_name = "nyc-taxi-model"
+model_name = "workspace.default.nyc-taxi-model-prefect"
 alias = "champion"
 
 model_uri = f"models:/{model_name}@{alias}"
@@ -55,6 +55,7 @@ def preprocess(input_data):
     except AttributeError:
         cols = dv.get_feature_names()
 
+    # 
     X_df = pd.DataFrame(X.toarray(), columns=cols)
 
     return X_df
